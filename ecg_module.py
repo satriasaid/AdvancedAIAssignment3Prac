@@ -352,6 +352,223 @@ class PTBXLDataset(Dataset):
         std[std < 1e-08] = 1.0
         return (ecg - mean) / std
 
+class Challenge2020Dataset(Dataset):
+    """Challenge 2020 ECG Dataset — loads directly from wfdb database files.
+
+    Records are downloaded on-the-fly (via wfdb) if the local directory is empty.
+    """
+
+    def __init__(self, data_dir: Path, sampling_rate: int = 100, target_length: int = 1000, normalize: bool = True, force_download: bool = False):
+        self.data_dir = Path(data_dir)
+        self.sampling_rate = sampling_rate
+        self.target_length = target_length
+        self.normalize = normalize
+
+        # Find records: check subfolders recursively for .hea files
+        hea_files = sorted(self.data_dir.glob("**/*.hea"))
+        if len(hea_files) == 0:
+            if force_download or not (self.data_dir / "RECORDS").exists():
+                print(f"No Challenge 2020 records found in {self.data_dir}.")
+                print("Attempting to download via wfdb...")
+                self._download_via_wfdb()
+                hea_files = sorted(self.data_dir.glob("**/*.hea"))
+
+        if len(hea_files) == 0:
+            raise FileNotFoundError(
+                f"No Challenge 2020 records (.hea files) found in {self.data_dir}. "
+                "Please download the dataset: wfdb.dl_database_files('challenge-2020', <path>)"
+            )
+
+        # Extract record names (stem without .hea)
+        self.records = sorted(set(f.stem for f in hea_files))
+        self._load_reference_data()
+        self.labels = [self._map_label(rec) for rec in self.records]
+        print(f"Challenge 2020 set: {len(self.records)} records")
+        self._print_class_distribution()
+
+    def _download_via_wfdb(self):
+        """Download Challenge 2020 via wfdb."""
+        try:
+            wfdb.dl_database_files("challenge-2020", str(self.data_dir))
+            print(f"Downloaded Challenge 2020 to {self.data_dir}")
+        except Exception as e:
+            print(f"wfdb download failed: {e}")
+            raise FileNotFoundError(
+                f"Challenge 2020 download failed. Please manually download from "
+                f"https://physionet.org/files/challenge-2020/1.0.2/ into {self.data_dir}"
+            )
+
+    def _load_reference_data(self):
+        """Load Challenge 2020 reference CSV."""
+        import ast
+        ref_path = self.data_dir / "reference.csv"
+        self.reference = {}
+        if ref_path.exists():
+            df = pd.read_csv(ref_path)
+            for _, row in df.iterrows():
+                self.reference[row["record"]] = row
+        else:
+            warnings.warn(f"reference.csv not found at {ref_path}. Using first-label mapping.")
+
+    def _parse_labels_csv(self, labels_str: str) -> List[str]:
+        """Parse labels from CSV string."""
+        try:
+            labels = ast.literal_eval(labels_str)
+            if isinstance(labels, list):
+                return labels
+            return [labels]
+        except:
+            return []
+
+    def _map_label(self, record_name: str) -> str:
+        """Map Challenge 2020 record to assignment label."""
+        if record_name in self.reference:
+            row = self.reference[record_name]
+            if "labels" in row:
+                diagnostic_codes = self._parse_labels_csv(str(row["labels"]))
+                return map_challenge_2020_label(diagnostic_codes)
+        return "OTHERS"
+
+    def _print_class_distribution(self):
+        """Print class distribution."""
+        from collections import Counter
+        counts = Counter(self.labels)
+        print(f"  Class distribution: {dict(counts)}")
+
+    def __len__(self):
+        return len(self.records)
+
+    def __getitem__(self, idx):
+        record_name = self.records[idx]
+        # wfdb reads the record by name; it looks for .hea/.dat alongside each other
+        record_path = str(self.data_dir / record_name)
+        try:
+            record = wfdb.rdrecord(record_path)
+        except Exception as e:
+            raise RuntimeError(f"Failed to load record {record_name}: {e}")
+        ecg = record.p_signal.T  # Shape: (num_leads, samples)
+
+        # Resample if needed
+        if record.fs != self.sampling_rate:
+            num_samples = int(ecg.shape[1] * self.sampling_rate / record.fs)
+            ecg = signal.resample(ecg, num_samples, axis=1)
+
+        ecg = self._pad_or_truncate(ecg)
+        if self.normalize:
+            ecg = self._normalize(ecg)
+
+        label = self.labels[idx]
+        label_idx = config.class_names.index(label)
+        return {
+            "ecg": torch.FloatTensor(ecg),
+            "label": torch.LongTensor([label_idx]),
+            "label_str": label,
+            "record_name": record_name,
+            "source": "challenge_2020",
+        }
+
+    def _pad_or_truncate(self, ecg: np.ndarray) -> np.ndarray:
+        if ecg.shape[1] < self.target_length:
+            ecg = np.pad(ecg, ((0, 0), (0, self.target_length - ecg.shape[1])), mode="constant")
+        elif ecg.shape[1] > self.target_length:
+            ecg = ecg[:, : self.target_length]
+        return ecg
+
+    def _normalize(self, ecg: np.ndarray) -> np.ndarray:
+        mean = ecg.mean(axis=1, keepdims=True)
+        std = ecg.std(axis=1, keepdims=True)
+        std[std < 1e-08] = 1.0
+        return (ecg - mean) / std
+
+
+class CombinedECGDataset(Dataset):
+    """
+    Combined dataset wrapping PTB-XL and Challenge 2020 for joint training.
+
+    Both datasets are loaded, then split together using PTB-XL's stratified
+    patient-level split as the primary split, with Challenge 2020 records
+    added to the train split only.
+    """
+
+    def __init__(
+        self,
+        ptb_xl_dir: Path,
+        challenge_2020_dir: Path,
+        split: str = "train",
+        sampling_rate: int = 100,
+        target_length: int = 1000,
+        normalize: bool = True,
+        use_stratified_split: bool = True,
+        val_ratio: float = 0.2,
+        challenge_as_val: bool = False,
+    ):
+        self.sampling_rate = sampling_rate
+        self.target_length = target_length
+        self.normalize = normalize
+
+        # Load PTB-XL dataset
+        self.ptb_dataset = PTBXLDataset(
+            data_dir=ptb_xl_dir,
+            split=split,
+            sampling_rate=sampling_rate,
+            target_length=target_length,
+            normalize=normalize,
+            use_stratified_split=use_stratified_split,
+        )
+
+        # Load Challenge 2020 dataset
+        try:
+            self.challenge_dataset = Challenge2020Dataset(
+                data_dir=challenge_2020_dir,
+                sampling_rate=sampling_rate,
+                target_length=target_length,
+                normalize=normalize,
+            )
+            has_challenge = True
+        except Exception as e:
+            warnings.warn(f"Could not load Challenge 2020 dataset: {e}")
+            self.challenge_dataset = None
+            has_challenge = False
+
+        # Build combined index
+        if split == "train":
+            if has_challenge and not challenge_as_val:
+                # Add all Challenge 2020 records to training
+                self._indices = [
+                    (self.ptb_dataset, i) for i in range(len(self.ptb_dataset))
+                ] + [
+                    (self.challenge_dataset, i) for i in range(len(self.challenge_dataset))
+                ]
+                print(f"Combined train set: {len(self.ptb_dataset)} PTB-XL + {len(self.challenge_dataset)} Challenge 2020 = {len(self)} total")
+            else:
+                self._indices = [(self.ptb_dataset, i) for i in range(len(self.ptb_dataset))]
+                print(f"Combined train set: {len(self.ptb_dataset)} PTB-XL = {len(self)} total")
+        else:
+            # Val split: only PTB-XL (Challenge 2020 as val only if explicitly requested)
+            self._indices = [(self.ptb_dataset, i) for i in range(len(self.ptb_dataset))]
+            print(f"Val set: {len(self.ptb_dataset)} PTB-XL records")
+
+        # Collect all labels for class-weight computation
+        self.labels = [self._get_label(idx) for idx in range(len(self))]
+        self._print_class_distribution()
+
+    def _get_label(self, idx):
+        ds, i = self._indices[idx]
+        return ds.labels[i]
+
+    def _print_class_distribution(self):
+        from collections import Counter
+        counts = Counter(self.labels)
+        print(f"  Combined class distribution: {dict(counts)}")
+
+    def __len__(self):
+        return len(self._indices)
+
+    def __getitem__(self, idx):
+        ds, i = self._indices[idx]
+        return ds[i]
+
+
 class LocalECGDataset(Dataset):
     """Dataset for local validation/test ECG files."""
 

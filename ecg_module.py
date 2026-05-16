@@ -43,8 +43,8 @@ class ExperimentConfig:
     base_dir: str = '/home/21522611/Documents/AdvancedAIAssignment3Prac'
     output_dir: str = 'output'
     data_dir: str = 'data'
-    ptb_xl_dir: str = 'ptb-xl_1.0.1'
-    challenge_2020_dir: str = 'physionet.org/files/challenge-2020'
+    ptb_xl_dir: str = 'physionet.org/files/ptb-xl/1.0.3/'
+    challenge_2020_dir: str = 'physionet.org/files/challenge-2020/1.0.2'
     ptb_xl_url: str = 'https://physionet.org/files/ptb-xl/1.0.3/'
     challenge_2020_url: str = 'https://physionet.org/files/challenge-2020/1.0.2/'
     validation_dir: str = 'validation'
@@ -334,7 +334,7 @@ class PTBXLDataset(Dataset):
             ecg = self._normalize(ecg)
         label = self.labels[idx]
         label_idx = config.class_names.index(label)
-        return {'ecg': torch.FloatTensor(ecg), 'label': torch.LongTensor([label_idx]), 'label_str': label, 'patient_id': row['patient_id'], 'record_idx': record_idx}
+        return {'ecg': torch.FloatTensor(ecg), 'label': torch.LongTensor([label_idx]), 'label_str': label, 'record_id': str(record_idx), 'source': 'ptb_xl'}
 
     def _pad_or_truncate(self, ecg: np.ndarray) -> np.ndarray:
         """Pad or truncate ECG to target length."""
@@ -379,8 +379,21 @@ class Challenge2020Dataset(Dataset):
                 "Please download the dataset: wfdb.dl_database_files('challenge-2020', <path>)"
             )
 
-        # Extract record names (stem without .hea)
-        self.records = sorted(set(f.stem for f in hea_files))
+        # Extract record paths (relative to data_dir, without .hea extension)
+        all_records = sorted([str(f.relative_to(self.data_dir)).replace(".hea", "") for f in hea_files])
+        
+        # Filter out records missing .mat data files
+        self.records = []
+        missing_count = 0
+        for rec in all_records:
+            mat_path = self.data_dir / (rec + ".mat")
+            if mat_path.exists():
+                self.records.append(rec)
+            else:
+                missing_count += 1
+        if missing_count > 0:
+            warnings.warn(f"Filtered out {missing_count} Challenge 2020 records due to missing .mat files.")
+        
         self._load_reference_data()
         self.labels = [self._map_label(rec) for rec in self.records]
         print(f"Challenge 2020 set: {len(self.records)} records")
@@ -420,13 +433,27 @@ class Challenge2020Dataset(Dataset):
         except:
             return []
 
-    def _map_label(self, record_name: str) -> str:
+    def _map_label(self, record_path: str) -> str:
         """Map Challenge 2020 record to assignment label."""
-        if record_name in self.reference:
-            row = self.reference[record_name]
+        record_stem = Path(record_path).stem
+        if record_stem in self.reference:
+            row = self.reference[record_stem]
             if "labels" in row:
                 diagnostic_codes = self._parse_labels_csv(str(row["labels"]))
                 return map_challenge_2020_label(diagnostic_codes)
+        
+        # Fallback: Try to read labels from the .hea file directly
+        try:
+            hea_file = self.data_dir / (record_path + ".hea")
+            if hea_file.exists():
+                with open(hea_file, 'r') as f:
+                    for line in f:
+                        if line.startswith('# Dx:') or line.startswith('#Dx:'):
+                            diagnostic_codes = line.split(': ')[1].strip().split(',')
+                            return map_challenge_2020_label(diagnostic_codes)
+        except Exception:
+            pass
+            
         return "OTHERS"
 
     def _print_class_distribution(self):
@@ -463,7 +490,7 @@ class Challenge2020Dataset(Dataset):
             "ecg": torch.FloatTensor(ecg),
             "label": torch.LongTensor([label_idx]),
             "label_str": label,
-            "record_name": record_name,
+            "record_id": record_name,
             "source": "challenge_2020",
         }
 
@@ -1065,6 +1092,11 @@ def compute_metrics(y_true, y_pred, y_prob=None):
             metrics[f'{cls}_support'] = report[cls]['support']
     if y_prob is not None:
         try:
+            # Check for NaNs in probabilities
+            if np.isnan(y_prob).any():
+                print("Warning: y_prob contains NaN values. Skipping AUROC/AUPRC computation.")
+                return metrics
+
             y_true_onehot = np.zeros((len(y_true), len(config.class_names)))
             for (i, label) in enumerate(y_true):
                 y_true_onehot[i, label] = 1
@@ -1117,6 +1149,8 @@ def train_epoch(model, dataloader, criterion, optimizer, device, scheduler=None)
         outputs = model(ecg)
         loss = criterion(outputs, labels)
         loss.backward()
+        # Gradient clipping to prevent NaNs
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         losses.update(loss.item(), ecg.size(0))
         probs = F.softmax(outputs, dim=1)

@@ -326,6 +326,7 @@ class PTBXLDataset(Dataset):
         record_path = str(filepath).replace('.dat', '').replace('.hea', '')
         record = wfdb.rdrecord(record_path)
         ecg = record.p_signal.T
+        ecg = np.nan_to_num(ecg, nan=0.0, posinf=0.0, neginf=0.0)
         if record.fs != self.sampling_rate:
             num_samples = int(ecg.shape[1] * self.sampling_rate / record.fs)
             ecg = signal.resample(ecg, num_samples, axis=1)
@@ -474,6 +475,7 @@ class Challenge2020Dataset(Dataset):
         except Exception as e:
             raise RuntimeError(f"Failed to load record {record_name}: {e}")
         ecg = record.p_signal.T  # Shape: (num_leads, samples)
+        ecg = np.nan_to_num(ecg, nan=0.0, posinf=0.0, neginf=0.0)
 
         # Resample if needed
         if record.fs != self.sampling_rate:
@@ -632,6 +634,7 @@ class LocalECGDataset(Dataset):
     def __getitem__(self, idx):
         filepath = self.files[idx]
         ecg = np.load(filepath)
+        ecg = np.nan_to_num(ecg, nan=0.0, posinf=0.0, neginf=0.0)
         if ecg.shape != (12, 1000):
             if ecg.shape[0] == 1000 and ecg.shape[1] == 12:
                 ecg = ecg.T
@@ -1061,6 +1064,8 @@ def get_class_weights(labels):
             weights[i] = total / (num_classes * counts[class_name])
         else:
             weights[i] = 1.0
+    # Clip weights to prevent destabilizing gradient spikes on extremely rare classes (e.g. LBBB)
+    weights = torch.clamp(weights, max=10.0)
     return weights
 
 def compute_metrics(y_true, y_pred, y_prob=None):
@@ -1134,24 +1139,62 @@ def compute_confidence_metrics(probabilities, threshold=0.7):
     entropy = -np.sum(probabilities * np.log(probabilities + 1e-10), axis=1)
     return {'mean_confidence': max_probs.mean(), 'std_confidence': max_probs.std(), 'min_confidence': max_probs.min(), 'median_confidence': np.median(max_probs), 'low_confidence_ratio': (max_probs < threshold).mean(), 'mean_entropy': entropy.mean(), 'high_entropy_ratio': (entropy > 1.0).mean()}
 
-def train_epoch(model, dataloader, criterion, optimizer, device, scheduler=None):
-    """Train for one epoch."""
+def train_epoch(model, dataloader, criterion, optimizer, device, scaler=None):
+    """Train for one epoch with optional Automatic Mixed Precision (AMP)."""
     model.train()
     losses = AverageMeter()
     all_preds = []
     all_labels = []
     all_probs = []
     pbar = tqdm(dataloader, desc='Training')
+    
+    use_amp = (device.type == 'cuda') and (scaler is not None)
+    
     for batch in pbar:
         ecg = batch['ecg'].to(device)
         labels = batch['label'].reshape(-1).to(device)
         optimizer.zero_grad()
-        outputs = model(ecg)
-        loss = criterion(outputs, labels)
-        loss.backward()
-        # Gradient clipping to prevent NaNs
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+        
+        if use_amp:
+            with torch.cuda.amp.autocast():
+                outputs = model(ecg)
+                loss = criterion(outputs, labels)
+        else:
+            outputs = model(ecg)
+            loss = criterion(outputs, labels)
+        
+        # Check for NaNs/Infs in the loss
+        if not torch.isfinite(loss):
+            print(f"Warning: Non-finite loss ({loss.item()}) detected! skipping backward and optimizer step.")
+            optimizer.zero_grad()
+            continue
+            
+        if use_amp:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            # Gradient clipping to prevent NaNs
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            # PyTorch's scaler.step internally checks for NaNs/Infs and skips optimizer.step() if found.
+            # Calling scaler.update() resets the scaler state, preventing unscale_ errors.
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            # Check for NaNs/Infs in gradients (only needed when not using AMP)
+            gradients_finite = True
+            for p in model.parameters():
+                if p.grad is not None:
+                    if not torch.isfinite(p.grad).all():
+                        gradients_finite = False
+                        break
+            
+            if gradients_finite:
+                # Gradient clipping to prevent NaNs
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+            else:
+                print("Warning: Non-finite gradients detected! skipping optimizer step.")
+                optimizer.zero_grad()
         losses.update(loss.item(), ecg.size(0))
         probs = F.softmax(outputs, dim=1)
         preds = outputs.argmax(dim=1)
@@ -1193,9 +1236,9 @@ def validate(model, dataloader, criterion, device):
     metrics['confidence'] = compute_confidence_metrics(all_probs, config.confidence_threshold)
     return (metrics, all_labels, all_preds, all_probs)
 
-def train_model(model, train_loader, val_loader, config, class_weights=None):
+def train_model(model, train_loader, val_loader, config, class_weights=None, trial=None):
     """
-    Full training loop with early stopping and learning rate scheduling.
+    Full training loop with early stopping, learning rate scheduling, optional AMP, and Optuna pruning.
     
     Returns:
         Trained model, training history
@@ -1213,6 +1256,10 @@ def train_model(model, train_loader, val_loader, config, class_weights=None):
     history = {'train_loss': [], 'train_f1': [], 'val_loss': [], 'val_f1': [], 'lr': []}
     best_model_state = None
     best_f1 = 0.0
+    
+    # Initialize AMP GradScaler if on CUDA
+    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == 'cuda'))
+    
     print(f'\nTraining on {device}')
     print(f'Epochs: {config.num_epochs}')
     print(f'Batch size: {config.batch_size}')
@@ -1222,7 +1269,7 @@ def train_model(model, train_loader, val_loader, config, class_weights=None):
     print('-' * 60)
     for epoch in range(config.num_epochs):
         print(f'\nEpoch {epoch + 1}/{config.num_epochs}')
-        train_metrics = train_epoch(model, train_loader, criterion, optimizer, device)
+        train_metrics = train_epoch(model, train_loader, criterion, optimizer, device, scaler=scaler)
         (val_metrics, _, _, _) = validate(model, val_loader, criterion, device)
         scheduler.step(val_metrics['loss'])
         history['train_loss'].append(train_metrics['loss'])
@@ -1237,6 +1284,15 @@ def train_model(model, train_loader, val_loader, config, class_weights=None):
             best_f1 = val_metrics['f1_macro']
             best_model_state = model.state_dict().copy()
             print(f'  ↳ New best F1: {best_f1:.4f}')
+            
+        # Report progress and check for pruning if running under Optuna trial
+        if trial is not None:
+            trial.report(val_metrics['f1_macro'], epoch)
+            if trial.should_prune():
+                print(f"  ↳ Trial pruned early at epoch {epoch + 1} due to poor performance.")
+                import optuna
+                raise optuna.TrialPruned()
+                
         if early_stopping(val_metrics['f1_macro']):
             print(f'\nEarly stopping at epoch {epoch + 1}')
             break

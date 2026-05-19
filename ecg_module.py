@@ -997,6 +997,59 @@ def count_parameters(model):
     """Count trainable parameters."""
     return sum((p.numel() for p in model.parameters() if p.requires_grad))
 
+def load_deepecg_ssl_pretrained(model, pretrained_path, strict=False):
+    """
+    Load pretrained weights for DeepECGSSL model.
+
+    Args:
+        model: DeepECGSSL model instance
+        pretrained_path: Path to pretrained checkpoint (.pth or .pt file)
+        strict: Whether to strictly enforce that the keys in state_dict match
+
+    Returns:
+        model: Model with loaded weights
+    """
+    if not os.path.exists(pretrained_path):
+        print(f"Warning: Pretrained weights not found at {pretrained_path}")
+        return model
+
+    try:
+        checkpoint = torch.load(pretrained_path, map_location='cpu')
+
+        # Handle different checkpoint formats
+        if 'model' in checkpoint:
+            state_dict = checkpoint['model']
+        elif 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+        elif 'state_dict' in checkpoint:
+            state_dict = checkpoint['state_dict']
+        else:
+            state_dict = checkpoint
+
+        # Remove 'encoder.' prefix if present (from finetuning checkpoints)
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            if k.startswith('encoder.'):
+                new_state_dict[k.replace('encoder.', '')] = v
+            else:
+                new_state_dict[k] = v
+
+        # Load weights
+        missing_keys, unexpected_keys = model.load_state_dict(new_state_dict, strict=strict)
+
+        if missing_keys:
+            print(f"Missing keys: {missing_keys}")
+        if unexpected_keys:
+            print(f"Unexpected keys: {unexpected_keys}")
+
+        print(f"Successfully loaded pretrained weights from {pretrained_path}")
+
+    except Exception as e:
+        print(f"Error loading pretrained weights: {e}")
+        print("Continuing with random initialization...")
+
+    return model
+
 def create_architecture_diagram(save_path=None):
     """Create a text-based architecture diagram."""
     diagram = '\n    ╔════════════════════════════════════════════════════════════════════════════╗\n    ║          Hybrid CNN-Transformer Architecture with ResNet Backbone          ║\n    ╠════════════════════════════════════════════════════════════════════════════╣\n    ║                                                                            ║\n    ║  Input: 12-Lead ECG (B, 12, 1000)                                          ║\n    ║         │                                                                   ║\n    ║         ▼                                                                   ║\n    ║  ┌──────────────────────────────────────────────────────────────────┐     ║\n    ║  │                    ResNet Backbone (Local Features)               │     ║\n    ║  │  ┌──────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐          │     ║\n    ║  │  │ Stem │ → │ Stage 1  │ → │ Stage 2  │ → │ Stage 3  │          │     ║\n    ║  │  │ (64) │   │  (64)    │   │  (128)   │   │  (256)   │          │     ║\n    ║  │  └──────┘   └──────────┘   └──────────┘   └──────────┘          │     ║\n    ║  └──────────────────────────────────────────────────────────────────┘     ║\n    ║         │                                                                   ║\n    ║         ├─────────────────────────────────────────────┐                   ║\n    ║         │                                             │                   ║\n    ║         ▼ (Local Path)                               ▼ (Global Path)      ║\n    ║  ┌─────────────┐                             ┌────────────────┐           ║\n    ║  │ Global Pool │                             │  Patches       │           ║\n    ║  │    (256)    │                             │  Projection    │           ║\n    ║  └──────┬──────┘                             └───────┬────────┘           ║\n    ║         │                                            │                     ║\n    ║         ▼                                            ▼                     ║\n    ║  ┌─────────────┐                             ┌────────────────┐           ║\n    ║  │    FC       │                             │  Transformer   │           ║\n    ║  │   (256)     │                             │  Encoder       │           ║\n    ║  └──────┬──────┘                             │  (2 layers,    │           ║\n    ║         │                                     │   8 heads)     │           ║\n    ║         │                                     └───────┬────────┘           ║\n    ║         │                                             │                     ║\n    ║         │                                      Global Pool (256)           ║\n    ║         │                                             │                     ║\n    ║         └────────────────────┬────────────────────────┘                     ║\n    ║                              │                                            ║\n    ║                              ▼                                            ║\n    ║                    ┌─────────────────┐                                     ║\n    ║                    │  Gated Fusion   │                                     ║\n    ║                    │  (Local ⊙ Gate   │                                     ║\n    ║                    │   + Global ⊙     │                                     ║\n    ║                    │    (1-Gate))     │                                     ║\n    ║                    └────────┬─────────┘                                     ║\n    ║                             │                                              ║\n    ║                             ▼                                              ║\n    ║                    ┌─────────────────┐                                     ║\n    ║                    │ Classification  │                                     ║\n    ║                    │ Head (FC → 7)   │                                     ║\n    ║                    │ + Temp Scaling   │                                     ║\n    ║                    └────────┬─────────┘                                     ║\n    ║                             │                                              ║\n    ║                             ▼                                              ║\n    ║              Output: 7-Class Logits + Confidence Score                    ║\n    ║                                                                            ║\n    ╚════════════════════════════════════════════════════════════════════════════╝\n    '
@@ -1615,6 +1668,120 @@ class ECGExplainer:
             plt.savefig(save_path, dpi=150, bbox_inches='tight')
             print(f"Saved SHAP explanation to {save_path}")
         ecg_plot.show()
+class DeepECGSSL(nn.Module):
+    """
+    DeepECG-SSL: Self-supervised ECG Transformer model adapted from HeartWise-AI.
+
+    Architecture:
+    1. Convolutional feature extraction (4 layers)
+    2. Positional encoding
+    3. Transformer encoder (configurable layers)
+    4. Mean pooling + classification head
+
+    Reference: https://github.com/HeartWise-AI/DeepECG-SSL-finetune
+    """
+
+    def __init__(self, num_leads=12, num_classes=7, embed_dim=256, num_heads=8, num_layers=4, dropout=0.1):
+        super().__init__()
+
+        # Convolutional feature extraction (similar to wav2vec2 style)
+        # Each layer: (out_channels, kernel_size, stride)
+        self.feature_extractor = nn.Sequential(
+            ConvBlock1D(num_leads, 256, kernel_size=10, stride=2, padding=4),
+            ConvBlock1D(256, 256, kernel_size=8, stride=2, padding=3),
+            ConvBlock1D(256, 256, kernel_size=4, stride=2, padding=1),
+            ConvBlock1D(256, 256, kernel_size=4, stride=2, padding=1),
+        )
+
+        # Layer normalization after feature extraction
+        self.layer_norm = nn.LayerNorm(256)
+
+        # Project to embedding dimension if needed
+        self.post_extract_proj = nn.Linear(256, embed_dim) if embed_dim != 256 else None
+
+        # Convolutional positional encoding
+        self.conv_pos = nn.Conv1d(
+            embed_dim,
+            embed_dim,
+            kernel_size=128,
+            padding=128 // 2,
+            groups=16
+        )
+        self.conv_pos_activation = nn.GELU()
+
+        # Transformer encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=num_heads,
+            dim_feedforward=embed_dim * 4,
+            dropout=dropout,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True  # Pre-LN architecture for better stability
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers)
+
+        # Classification head
+        self.final_dropout = nn.Dropout(dropout)
+        self.classifier = nn.Linear(embed_dim, num_classes)
+
+        # Initialize weights
+        self._init_weights()
+
+    def _init_weights(self):
+        """Initialize weights for better training stability."""
+        nn.init.xavier_uniform_(self.classifier.weight)
+        nn.init.constant_(self.classifier.bias, 0.0)
+
+    def _compute_output_length(self, input_length):
+        """Compute sequence length after convolutions."""
+        # Each conv layer: output = floor((input - kernel + 2*padding) / stride + 1)
+        length = input_length
+        for _ in range(4):  # 4 conv layers with stride 2
+            length = (length - 1) // 2 + 1
+        return length
+
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor of shape (batch, num_leads, seq_len)
+
+        Returns:
+            logits: Output tensor of shape (batch, num_classes)
+        """
+        # Feature extraction
+        features = self.feature_extractor(x)  # (B, 256, T')
+        features = features.transpose(1, 2)  # (B, T', 256)
+        features = self.layer_norm(features)
+
+        # Project to embedding dimension
+        if self.post_extract_proj is not None:
+            features = self.post_extract_proj(features)  # (B, T', embed_dim)
+
+        # Add positional encoding
+        # Conv1d expects (B, C, T)
+        pos_conv_input = features.transpose(1, 2)  # (B, embed_dim, T')
+        pos_encoding = self.conv_pos(pos_conv_input)  # (B, embed_dim, T')
+        pos_encoding = self.conv_pos_activation(pos_encoding)
+        pos_encoding = pos_encoding.transpose(1, 2)  # (B, T', embed_dim)
+
+        # Add positional encoding to features
+        x = features + pos_encoding
+
+        # Transformer encoding
+        x = self.transformer(x)  # (B, T', embed_dim)
+
+        # Mean pooling over time dimension (ignoring zero-padded positions)
+        # Simple mean pooling
+        x = x.mean(dim=1)  # (B, embed_dim)
+
+        # Classification
+        x = self.final_dropout(x)
+        logits = self.classifier(x)  # (B, num_classes)
+
+        return logits
+
+
 class HybridNoGate(nn.Module):
     """Hybrid model without gated fusion (simple concatenation)."""
 

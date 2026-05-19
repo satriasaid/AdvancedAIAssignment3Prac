@@ -56,7 +56,7 @@ def objective(trial):
 
     # Model selection
     model_name = trial.suggest_categorical("model_type", [
-        "CNN1D", "ResNet1D", "CNNLSTM", "TransformerOnly", "HybridCNNTransformer"
+        "CNN1D", "ResNet1D", "CNNLSTM", "TransformerOnly", "HybridCNNTransformer", "DeepECGSSL"
     ])
 
     # Model-specific hyperparameters
@@ -84,6 +84,15 @@ def objective(trial):
             num_leads=12, num_classes=7, base_channels=base_channels,
             embed_dim=embed_dim, num_heads=num_heads,
             num_transformer_layers=num_layers, dropout=dropout
+        )
+    elif model_name == "DeepECGSSL":
+        embed_dim = trial.suggest_categorical("deepecg_embed_dim", [128, 256])
+        num_heads = trial.suggest_categorical("deepecg_heads", [4, 8])
+        num_layers = trial.suggest_int("deepecg_layers", 2, 6)
+        dropout = trial.suggest_float("deepecg_dropout", 0.1, 0.5)
+        model = ecg_module.DeepECGSSL(
+            num_leads=12, num_classes=7, embed_dim=embed_dim,
+            num_heads=num_heads, num_layers=num_layers, dropout=dropout
         )
 
     print(f"Trial {trial.number}: model={model_name}, lr={config.learning_rate}, bs={config.batch_size}")
@@ -129,7 +138,7 @@ if __name__ == "__main__":
         print("OPTUNA STUDY COMPLETE")
         print("="*60)
 
-        model_types = ["CNN1D", "ResNet1D", "CNNLSTM", "TransformerOnly", "HybridCNNTransformer"]
+        model_types = ["CNN1D", "ResNet1D", "CNNLSTM", "TransformerOnly", "HybridCNNTransformer", "DeepECGSSL"]
 
         for model_name in model_types:
             model_trials = [
@@ -168,6 +177,14 @@ if __name__ == "__main__":
                     num_leads=12, num_classes=7, base_channels=best_params["hybrid_base_channels"],
                     embed_dim=best_params["hybrid_embed_dim"], num_heads=best_params["hybrid_heads"],
                     num_transformer_layers=best_params["hybrid_layers"], dropout=best_params["hybrid_dropout"]
+                )
+            elif model_name == "DeepECGSSL":
+                model = ecg_module.DeepECGSSL(
+                    num_leads=12, num_classes=7,
+                    embed_dim=best_params["deepecg_embed_dim"],
+                    num_heads=best_params["deepecg_heads"],
+                    num_layers=best_params["deepecg_layers"],
+                    dropout=best_params["deepecg_dropout"]
                 )
 
             train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True)
